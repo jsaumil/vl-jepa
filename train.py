@@ -109,14 +109,11 @@ def get_label_prototypes(model, device, dataset, max_batches=8):
 
 
 @torch.no_grad()
-def predict_labels(model, y_pred, dataset, device):
-    fake_proto, real_proto = get_label_prototypes(
-        model, device, dataset, max_batches=4
-    )
+def predict_labels(y_pred, fake_proto, real_proto):
     if fake_proto is None:
         return None
 
-    y_pred_pooled = y_pred.mean(dim=1)
+    y_pred_pooled = y_pred.mean(dim=1) if y_pred.dim() == 3 else y_pred
     y_pred_norm = F.normalize(y_pred_pooled, dim=-1)
 
     sim_fake = y_pred_norm @ fake_proto
@@ -133,9 +130,21 @@ def evaluate(model, dataloader, device, dataset, max_batches=None):
     all_preds = []
     all_labels = []
 
+    fake_proto, real_proto = get_label_prototypes(
+        model, device, dataset, max_batches=4
+    )
+    model.eval()
+
+    try:
+        n_total = len(dataloader) if not max_batches else min(len(dataloader), max_batches)
+    except TypeError:
+        n_total = "?"
+    # print(f"Validating on {n_total} batches...", flush=True)
+
     for i, batch in enumerate(dataloader):
         if max_batches and i >= max_batches:
             break
+        t_b = time.time()
 
         x = batch["x"].to(device)
         query = batch["query"].to(device)
@@ -145,11 +154,13 @@ def evaluate(model, dataloader, device, dataset, max_batches=None):
         total_loss += loss.item()
         n_batches += 1
 
-        preds = predict_labels(model, y_pred, dataset, device)
+        preds = predict_labels(y_pred, fake_proto, real_proto)
         if preds is not None:
             labels = batch["label"].long()
             all_preds.append(preds)
             all_labels.append(labels)
+
+        # print(f"val batch {i + 1}/{n_total} completed, took {time.time() - t_b:.2f} sec", flush=True)
 
     avg_loss = total_loss / max(n_batches, 1)
     metrics = {"loss": avg_loss, "accuracy": 0.0, "precision": 0.0,
@@ -180,6 +191,7 @@ def train_one_epoch(model, dataloader, optimizer, scheduler, scaler, device, arg
     total_loss = 0.0
     n_batches = 0
     optimizer.zero_grad()
+    batch_start = time.time()
 
     for i, batch in enumerate(dataloader):
         x = batch["x"].to(device)
@@ -211,6 +223,10 @@ def train_one_epoch(model, dataloader, optimizer, scheduler, scaler, device, arg
         total_loss += loss.item() * args.grad_accum
         n_batches += 1
 
+        now = time.time()
+        # print(f"batch {i + 1} completed, took {now - batch_start:.2f} sec")
+        batch_start = now
+
     return total_loss / max(n_batches, 1)
 
 
@@ -227,9 +243,19 @@ def save_checkpoint(model, optimizer, scheduler, scaler, epoch, loss, path):
 
 def load_checkpoint(path, model, optimizer, scheduler, scaler):
     ckpt = torch.load(path, map_location="cpu")
-    model.load_state_dict(ckpt["model_state_dict"])
-    optimizer.load_state_dict(ckpt["optimizer_state_dict"])
-    scheduler.load_state_dict(ckpt["scheduler_state_dict"])
+    missing, unexpected = model.load_state_dict(ckpt["model_state_dict"], strict=False)
+    if missing:
+        print(f"load_checkpoint: missing keys (using init values): {missing}")
+    if unexpected:
+        print(f"load_checkpoint: unexpected keys (ignored): {unexpected}")
+    if missing or unexpected:
+        # model architecture changed since this checkpoint was saved (e.g. new
+        # params) -- the old optimizer/scheduler state won't line up with the
+        # new param groups, so start those fresh rather than crashing.
+        print("load_checkpoint: model shape changed, skipping optimizer/scheduler state (starting fresh)")
+    else:
+        optimizer.load_state_dict(ckpt["optimizer_state_dict"])
+        scheduler.load_state_dict(ckpt["scheduler_state_dict"])
     if scaler and ckpt.get("scaler_state_dict"):
         scaler.load_state_dict(ckpt["scaler_state_dict"])
     return ckpt["epoch"], ckpt["loss"]

@@ -1,3 +1,4 @@
+import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -28,6 +29,8 @@ class DeepFake(nn.Module):
         self.text_pos = nn.Parameter(
             torch.zeros(1, self.max_k, embed_dim)
         )
+        # CLIP-style learnable temperature, clamped so logits can't blow up
+        self.logit_scale = nn.Parameter(torch.ones([]) * math.log(1 / 0.07))
 
     def forward(self, x, query, y, train=False):
         x = self.patcher(x)
@@ -49,7 +52,10 @@ class DeepFake(nn.Module):
             y_pred = y_pred.mean(dim=1) # [B, C]
             y = y.mean(dim=1) # [B, C]
 
-            logits = y_pred @ y.transpose(-1,-2)
+            y_pred_n = F.normalize(y_pred, dim=-1)
+            y_n = F.normalize(y, dim=-1)
+            logit_scale = self.logit_scale.clamp(max=math.log(100)).exp()
+            logits = logit_scale * (y_pred_n @ y_n.transpose(-1, -2))
             labels = torch.arange(logits.shape[0], device=logits.device)
             loss_i2t = F.cross_entropy(logits, labels)
             loss_t2i = F.cross_entropy(logits.t(), labels)
